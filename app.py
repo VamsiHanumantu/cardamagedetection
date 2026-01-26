@@ -5,20 +5,22 @@ import io
 import torch
 import torch.nn as nn
 from torchvision import transforms
-from torchvision.models import resnet50, ResNet50_Weights
+from torchvision.models import resnet50
 
 # =============================
-# LOAD MODELS
+# LOAD MODELS (OFFLINE ONLY)
 # =============================
 @st.cache_resource
 def load_models():
-    # YOLO for damage localization
+    # YOLO damage detection (local weights)
     damage_model = YOLO("best.pt")
 
-    # ResNet-50 for refined damage classification
-    resnet = resnet50(weights=ResNet50_Weights.DEFAULT)
+    # ResNet-50 classification (NO pretrained download)
+    resnet = resnet50(weights=None)
     resnet.fc = nn.Linear(2048, 6)  # number of damage classes
-    resnet.load_state_dict(torch.load("resnet50_damage.pt", map_location="cpu"))
+    resnet.load_state_dict(
+        torch.load("resnet50_damage.pt", map_location="cpu")
+    )
     resnet.eval()
 
     return damage_model, resnet
@@ -26,7 +28,7 @@ def load_models():
 damage_model, resnet = load_models()
 
 # =============================
-# RESNET TRANSFORM
+# RESNET IMAGE TRANSFORM
 # =============================
 resnet_transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -38,7 +40,7 @@ resnet_transform = transforms.Compose([
 ])
 
 # =============================
-# DAMAGE COSTS
+# DAMAGE COST CONFIG
 # =============================
 damage_costs = {
     "dent": {"part": 300, "labor": 150},
@@ -50,7 +52,7 @@ damage_costs = {
 }
 
 # =============================
-# RESNET REFINEMENT FUNCTION
+# RESNET REFINEMENT LOGIC
 # =============================
 def refine_with_resnet(image_pil, boxes):
     preds = []
@@ -70,18 +72,18 @@ def refine_with_resnet(image_pil, boxes):
     return None
 
 # =============================
-# UI
+# STREAMLIT UI
 # =============================
 st.title("🚗 Car Damage Detection & Repair Cost Estimator")
 
 st.write(
-    "Upload an image of a damaged car. "
-    "The system detects damaged regions using YOLO and refines the damage type using ResNet-50."
+    "Upload a damaged car image. "
+    "The system localizes damage using YOLO and refines classification using ResNet-50."
 )
 
-# -------------------------------------------------
-# DAMAGE IMAGE UPLOAD
-# -------------------------------------------------
+# -----------------------------
+# IMAGE UPLOAD
+# -----------------------------
 damage_file = st.file_uploader(
     "Upload damaged car image",
     type=["jpg", "jpeg", "png"]
@@ -89,7 +91,7 @@ damage_file = st.file_uploader(
 
 if damage_file:
     damage_img = Image.open(io.BytesIO(damage_file.read())).convert("RGB")
-    st.image(damage_img, caption="Uploaded Damage Image", use_container_width=True)
+    st.image(damage_img, caption="Uploaded Image", use_container_width=True)
 
     with st.spinner("🔍 Detecting damage..."):
         results = damage_model.predict(damage_img)

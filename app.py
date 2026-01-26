@@ -4,6 +4,10 @@ from PIL import Image
 import easyocr
 import io
 import numpy as np
+import torch
+import torch.nn as nn
+from torchvision import transforms
+from torchvision.models import resnet50, ResNet50_Weights
 
 # =============================
 # MOCK DATABASE
@@ -21,11 +25,33 @@ REGISTERED_PLATES = {
 # =============================
 @st.cache_resource
 def load_models():
+    # YOLO for detection
     damage_model = YOLO("best.pt")
-    ocr_reader = easyocr.Reader(['en'], gpu=False)
-    return damage_model, ocr_reader
 
-damage_model, ocr_reader = load_models()
+    # EasyOCR
+    ocr_reader = easyocr.Reader(['en'], gpu=False)
+
+    # ResNet for refinement
+    resnet = resnet50(weights=ResNet50_Weights.DEFAULT)
+    resnet.fc = nn.Linear(2048, 6)  # 6 damage classes
+    resnet.load_state_dict(torch.load("resnet50_damage.pt", map_location="cpu"))
+    resnet.eval()
+
+    return damage_model, ocr_reader, resnet
+
+damage_model, ocr_reader, resnet = load_models()
+
+# =============================
+# TRANSFORM FOR RESNET
+# =============================
+resnet_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
 
 # =============================
 # DAMAGE COSTS
@@ -48,7 +74,6 @@ def normalize_plate(text):
 def extract_plate(image_pil):
     image_np = np.array(image_pil)
     results = ocr_reader.readtext(image_np)
-
     ocr_texts = [normalize_plate(text) for _, text, _ in results]
 
     for plate in REGISTERED_PLATES:
@@ -57,6 +82,23 @@ def extract_plate(image_pil):
                 return plate, ocr_texts
 
     return None, ocr_texts
+
+def refine_with_resnet(image_pil, boxes):
+    preds = []
+
+    for box in boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+        crop = image_pil.crop((x1, y1, x2, y2))
+        tensor = resnet_transform(crop).unsqueeze(0)
+
+        with torch.no_grad():
+            logits = resnet(tensor)
+            preds.append(logits)
+
+    if preds:
+        return torch.mean(torch.stack(preds), dim=0)
+
+    return None
 
 # =============================
 # SESSION STATE
@@ -72,7 +114,7 @@ if "plate_number" not in st.session_state:
 st.title("🚗 Car Damage Detection System")
 
 # -------------------------------------------------
-# STEP 1: NUMBER PLATE IMAGE UPLOAD
+# STEP 1: NUMBER PLATE VERIFICATION
 # -------------------------------------------------
 st.header("Step 1️⃣ Upload Number Plate Image")
 
@@ -86,8 +128,7 @@ if plate_file and not st.session_state.plate_verified:
     plate_img = Image.open(io.BytesIO(plate_file.read())).convert("RGB")
     st.image(plate_img, caption="Uploaded Number Plate Image", use_container_width=True)
 
-    with st.spinner("🔍 Detecting number plate..."):
-        plate_number, ocr_texts = extract_plate(plate_img)
+    plate_number, ocr_texts = extract_plate(plate_img)
 
     st.subheader("🔎 OCR Detected Text")
     st.write(ocr_texts)
@@ -101,7 +142,7 @@ if plate_file and not st.session_state.plate_verified:
     st.session_state.plate_number = plate_number
 
 # -------------------------------------------------
-# STEP 2: DAMAGE IMAGE UPLOAD (ONLY IF VERIFIED)
+# STEP 2: DAMAGE DETECTION + RESNET REFINEMENT
 # -------------------------------------------------
 if st.session_state.plate_verified:
     st.header("Step 2️⃣ Upload Damaged Car Image")
@@ -116,19 +157,18 @@ if st.session_state.plate_verified:
         damage_img = Image.open(io.BytesIO(damage_file.read())).convert("RGB")
         st.image(damage_img, caption="Uploaded Damage Image", use_container_width=True)
 
-        with st.spinner("🚗 Detecting damage..."):
-            results = damage_model.predict(damage_img)
-
+        results = damage_model.predict(damage_img)
         r = results[0]
-        st.image(r.plot(), caption="Detected Damage", use_container_width=True)
+
+        st.image(r.plot(), caption="YOLO Damage Detection", use_container_width=True)
 
         if r.boxes is not None and len(r.boxes) > 0:
-            best_idx = r.boxes.conf.argmax().item()
-            label = damage_model.names[int(r.boxes.cls[best_idx].item())]
-            conf = float(r.boxes.conf[best_idx].item())
+            refined_logits = refine_with_resnet(damage_img, r.boxes)
+            refined_class = torch.argmax(refined_logits).item()
+            label = damage_model.names[refined_class]
 
-            st.subheader("🔍 Most Likely Damage")
-            st.write(f"**{label.capitalize()}** (Confidence: {conf:.2f})")
+            st.subheader("🔍 Final Damage Prediction (YOLO + ResNet)")
+            st.write(f"**{label.capitalize()}**")
 
             if label in damage_costs:
                 part = damage_costs[label]["part"]
